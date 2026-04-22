@@ -1,0 +1,2 @@
+source /home/tan11/esp/hello_world/build/gdbinit/symbols
+source /home/tan11/esp/hello_world/build/gdbinit/connect

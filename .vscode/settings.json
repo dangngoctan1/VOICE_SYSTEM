@@ -1,0 +1,8 @@
+{
+    "idf.currentSetup": "/home/tan11/.espressif/v6.0/esp-idf",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "idf.port": "/dev/ttyACM0",
+    "idf.flashType": "UART"
+}

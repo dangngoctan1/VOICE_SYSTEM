@@ -1,0 +1,9 @@
+Command: cmake -G Ninja -B /home/tan11/esp/hello_world/build -DPYTHON_DEPS_CHECKED=1 -DPYTHON=/home/tan11/.espressif/tools/python/v6.0/venv/bin/python3 -DESP_PLATFORM=1 -DSDKCONFIG='/home/tan11/esp/hello_world/sdkconfig' -DCCACHE_ENABLE=False /home/tan11/esp/hello_world
+Configuration Report               
+ ───────────────────────────────── 
+   Parser Version: 1               
+   Verbosity: default              
+   Defaults policy: sdkconfig      
+   Status: Finished successfully   
+                                   
+ ───────────────────────────────── 
