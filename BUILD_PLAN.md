@@ -253,10 +253,11 @@ idf_component_register(
 
 ---
 
-## 🔄 GIAI ĐOẠN 2: Tích Hợp ESP-SR — Wake Word + Command — **ĐANG THỰC HIỆN**
+## 🔄 GIAI ĐOẠN 2: Tích Hợp ESP-SR — Wake Word + Command — **ĐANG DEBUG (wake word chưa trigger)**
 
 > **Mục tiêu:** ESP32-S3 nhận diện "Hi ESP" và các lệnh màu sắc bằng tiếng Anh.  
 > **Build từ:** Code Giai đoạn 1 (giữ nguyên I2S, thêm lớp AI phía trên).
+> **Trạng thái hiện tại (22/04/2026):** AFE + MultiNet init OK. Feed/detect task chạy, nhưng `wakeup_state=0` liên tục qua 2500+ fetch cycles — WakeNet không trigger khi nói "Hi ESP". Xem mục 2.4b để debug.
 
 ### 2.1 Thêm ESP-SR qua Component Manager ✅ (đã làm)
 
@@ -306,83 +307,181 @@ Component config → ESP-SR
 > - Đã chọn đúng model `wn9_hiesp` và `mn6_en` chưa?
 > - Đã save & sync sau khi thay đổi chưa?
 
-### 2.4 Cấu hình AFE (Audio Front-End) — 🔄 Cần làm tiếp
+### 2.4 Cấu hình AFE (Audio Front-End) — ✅ Init OK, đang debug wake word
 
-Cập nhật `CMakeLists.txt` — thêm ESP-SR vào REQUIRES:
+> ✅ **API thực tế dùng:** `afe_config_init()` + `esp_afe_handle_from_config()` (API mới của esp-sr >= 2.x, tương thích IDF v6.0). Khác với code trong plan gốc dùng `AFE_CONFIG_DEFAULT()` + `&ESP_AFE_SR_HANDLE` — API cũ không còn hỗ trợ.
+
+`CMakeLists.txt` giữ nguyên (đã đúng):
 
 ```cmake
 idf_component_register(
     SRCS "hello_world.c"
     INCLUDE_DIRS "."
-    REQUIRES driver esp_driver_i2s esp_afe_sr_models esp_mn_models
+    REQUIRES driver esp_driver_i2s esp-sr
 )
 ```
 
-Thêm vào code (giữ nguyên phần I2S đã có):
+Code AFE init (đúng với API mới) — đang dùng với `srmodel_list` thay vì NULL:
 
 ```c
-#include "esp_afe_sr_iface.h"
-#include "esp_afe_sr_models.h"
-#include "esp_mn_iface.h"
-#include "esp_mn_models.h"
-#include "model_path.h"
+static void init_afe(void) {
+    srmodel_list_t *models = esp_srmodel_init("model");
+    // In ra tên model để xác nhận wn9_hiesp đang được load
+    for (int i = 0; i < models->num; i++)
+        ESP_LOGI(TAG, "Model[%d]: %s", i, models->model_name[i]);
 
-// AFE xử lý: Noise Suppression + VAD + chuẩn hóa cho AI
-const esp_afe_sr_iface_t *afe_handle = &ESP_AFE_SR_HANDLE;
-afe_config_t afe_config = AFE_CONFIG_DEFAULT();
-afe_config.aec_init = false;        // Không có loa phản hồi → tắt AEC
-afe_config.se_init = true;          // Bật Noise Suppression
-afe_config.vad_init = true;         // Bật Voice Activity Detection
-afe_config.wakenet_init = true;     // Bật WakeNet (wn9_hiesp)
-afe_config.voice_communication_init = false;
+    char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, NULL);
+    ESP_LOGI(TAG, "WakeNet: %s", wn_name);  // phải in ra wn9_hiesp
 
-esp_afe_sr_data_t *afe_data = afe_handle->create_from_config(&afe_config);
+    afe_config_t *cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
+    cfg->aec_init           = false;
+    cfg->se_init            = true;
+    cfg->vad_init           = true;
+    cfg->wakenet_init       = true;
+    cfg->wakenet_model_name = wn_name;
+
+    afe_handle = esp_afe_handle_from_config(cfg);
+    afe_data   = afe_handle->create_from_config(cfg);
+    afe_handle->set_wakenet_threshold(afe_data, 1, 0.25f);  // đã hạ từ 0.4 xuống 0.25
+}
 ```
 
-### 2.5 Feed dữ liệu I2S vào AFE pipeline ✅ (đã làm)
+---
+
+### 2.4b 🐛 DEBUG: Wake Word `wakeup_state=0` — Checklist & Fix
+
+**Triệu chứng:** AFE + MultiNet init thành công, feed/detect task chạy bình thường, nhưng `wakeup_state` luôn bằng 0 sau hàng nghìn fetch cycle khi nói "Hi ESP".
+
+#### Bước 1: Xác nhận model wn9 đang được load
+
+Khi boot, phải thấy dòng:
+```
+I (XXXX) AI_MIC: WakeNet: wn9_hiesp
+```
+Nếu thấy `wn8_` hoặc không thấy → vào **SDK Configuration Editor** → `ESP-SR` → Wake Word Engine → chọn **wn9_hiesp** → Save → Build lại.
+
+#### Bước 2: Fix shift bit — nguyên nhân phổ biến nhất
+
+INMP441 xuất audio left-justified trong frame 32-bit. Shift sai → signal quá nhỏ → WakeNet không nhận ra.
 
 ```c
-// Task chạy trên Core 1 — thay thế mic_read_task cũ
-void audio_feed_task(void *arg) {
-    int audio_chunksize = afe_handle->get_feed_chunksize(afe_data);
-    int16_t *audio_buffer = malloc(audio_chunksize * sizeof(int16_t));
+// ❌ Code hiện tại (có thể sai):
+buf16[i] = (int16_t)(buf32[i] >> 10);
+
+// ✅ Đúng cho INMP441 với IDF v6.0:
+buf16[i] = (int16_t)(buf32[i] >> 14);
+```
+
+> **Giai đoạn 1** dùng `>> 8` để lấy peak/RMS cho hiển thị (OK). **AFE pipeline** cần `>> 14` để ra int16 đúng scale [-32768, 32767] mà WakeNet expect.
+
+#### Bước 3: Thêm amplitude log để verify signal
+
+Thêm vào cuối vòng for trong `audio_feed_task`, trước `afe_handle->feed()`:
+
+```c
+// Verify mic signal trước khi feed vào AFE
+static int amp_log_cnt = 0;
+if (++amp_log_cnt % 100 == 0) {
+    int32_t max_amp = 0;
+    for (int i = 0; i < n; i++)
+        if (abs(buf16[i]) > max_amp) max_amp = abs(buf16[i]);
+    ESP_LOGI(TAG, "Max amplitude: %ld (im lặng~<500 | nói to~>3000)", max_amp);
+}
+```
+
+**Kết quả mong đợi:**
+- Im lặng: `max_amp` ~ 100–500
+- Nói bình thường: `max_amp` > 3000
+- Nói to gần mic: `max_amp` > 8000
+
+Nếu khi nói to mà `max_amp` vẫn < 500 → vấn đề phần cứng (kiểm tra dây) hoặc shift bit sai.
+
+#### Bước 4: Hạ threshold WakeNet
+
+```c
+// Trong init_afe(), sau create_from_config():
+afe_handle->set_wakenet_threshold(afe_data, 1, 0.25f);  // từ 0.4 → 0.25
+```
+
+#### Bước 5 (nếu vẫn không nhận): Thử MODE_LOW_COST
+
+```c
+// Thay AFE_MODE_HIGH_PERF bằng:
+afe_config_t *cfg = afe_config_init("M", models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+```
+
+`HIGH_PERF` tiêu tốn nhiều PSRAM hơn và có thể gây bottleneck trên một số cấu hình. `LOW_COST` nhẹ hơn, thực tế nhiều người dùng thành công hơn với INMP441 đơn.
+
+#### Bảng tóm tắt nguyên nhân & fix
+
+| # | Nguyên nhân | Dấu hiệu | Fix |
+|---|---|---|---|
+| 1 | Model không phải wn9_hiesp | Log boot in `wn8_` hoặc không có WakeNet | menuconfig → chọn wn9_hiesp |
+| 2 | Shift bit sai (`>> 10`) | max_amp < 500 khi nói to | Đổi thành `>> 14` |
+| 3 | Threshold quá cao (0.4) | max_amp OK nhưng vẫn không trigger | Hạ xuống `0.25f` |
+| 4 | AFE_MODE_HIGH_PERF gây bottleneck | Không rõ ràng | Thử `AFE_MODE_LOW_COST` |
+| 5 | Phần cứng: L/R chưa nối GND | max_amp ~ 0 mọi lúc | Kiểm tra dây L/R nối GND |
+
+### 2.5 Feed dữ liệu I2S vào AFE pipeline — ✅ Đang chạy (cần fix shift bit)
+
+```c
+static void audio_feed_task(void *arg) {
+    int      chunk = afe_handle->get_feed_chunksize(afe_data);
+    int16_t *buf16 = malloc(chunk * sizeof(int16_t));
+    int32_t *buf32 = malloc(chunk * sizeof(int32_t));
 
     while (1) {
-        size_t bytes_read;
-        int32_t raw[audio_chunksize];
-        i2s_channel_read(rx_handle, raw, audio_chunksize * 4, &bytes_read, portMAX_DELAY);
+        size_t bytes_read = 0;
+        i2s_channel_read(rx_handle, buf32, chunk * sizeof(int32_t),
+                         &bytes_read, portMAX_DELAY);
 
-        // Convert 32-bit → 16-bit (ESP-SR yêu cầu int16)
-        for (int i = 0; i < audio_chunksize; i++) {
-            audio_buffer[i] = (int16_t)(raw[i] >> 14);
+        int n = bytes_read / sizeof(int32_t);
+        for (int i = 0; i < n; i++) {
+            // ✅ INMP441: shift >> 14 cho AFE pipeline (không phải >> 8 hay >> 10)
+            buf16[i] = (int16_t)(buf32[i] >> 14);
         }
 
-        afe_handle->feed(afe_data, audio_buffer);
+        afe_handle->feed(afe_data, buf16);
     }
 }
 ```
 
-### 2.6 Nhận kết quả từ AFE + WakeNet + MultiNet ✅ (đã làm)
+> ⚠️ **Shift value quan trọng:** `>> 8` (Giai đoạn 1) chỉ để xem peak/RMS. `>> 14` là giá trị đúng cho WakeNet/MultiNet với INMP441 + I2S 32-bit slot trên IDF v6.0.
+
+### 2.6 Nhận kết quả từ AFE + WakeNet + MultiNet — ✅ Đã implement, chờ wake word hoạt động
 
 ```c
-void audio_detect_task(void *arg) {
+static void audio_detect_task(void *arg) {
+    bool listening = false;
+
     while (1) {
         afe_fetch_result_t *res = afe_handle->fetch(afe_data);
         if (!res) continue;
 
         if (res->wakeup_state == WAKENET_DETECTED) {
-            ESP_LOGI("AI", ">>> Wake word detected! Listening for command...");
+            ESP_LOGI("AI", ">>> WAKE WORD detected! Listening...");
+            listening = true;
+            multinet->clean(model_data);
         }
 
-        if (res->command_id >= 0) {
-            ESP_LOGI("AI", ">>> Command ID: %d", res->command_id);
-            // command_id 0 = "turn on red", 1 = "turn on green", v.v.
+        if (listening) {
+            esp_mn_state_t state = multinet->detect(model_data, res->data);
+
+            if (state == ESP_MN_STATE_DETECTED) {
+                esp_mn_results_t *mn_res = multinet->get_results(model_data);
+                ESP_LOGI("AI", ">>> COMMAND id=%d phrase='%s' prob=%.2f",
+                    mn_res->command_id[0], mn_res->string, mn_res->prob[0]);
+                listening = false;
+            } else if (state == ESP_MN_STATE_TIMEOUT) {
+                ESP_LOGW("AI", ">>> TIMEOUT — say 'Hi ESP' again");
+                listening = false;
+            }
         }
     }
 }
 ```
 
-### 2.7 Định nghĩa Command List — cần làm tiếp
+### 2.7 Định nghĩa Command List — ✅ Đã implement trong code (8 commands)
 
 Tạo file `main/commands_en.txt`:
 
@@ -399,7 +498,7 @@ lights off
 
 Khai báo trong code qua `multinet_handle` sau khi wake word được phát hiện.
 
-### 2.8 Cập nhật app_main — cần làm tiếp
+### 2.8 Cập nhật app_main — ✅ Đã implement
 
 ```c
 void app_main(void) {
@@ -416,18 +515,21 @@ void app_main(void) {
 
 | # | Kiểm tra | Cách thực hiện | Kết quả mong đợi | Trạng thái |
 |---|---|---|---|---|
-| T2.1 | Build thành công (với ESP-SR) | Click **🔧 Build** | Không có lỗi `Failed to allocate tensors` | 🔄 Cần build lại sau khi thêm code AFE |
-| T2.2 | Khởi động board | Click **🔥** | Monitor in `AFE initialized`, `WakeNet ready` | ⏳ |
-| T2.3 | Wake word | Nói **"Hi ESP"** | Monitor in `Wake word detected!` trong ≤ 1 giây | ⏳ |
-| T2.4 | Lệnh đỏ | Sau wake word, nói **"turn on red"** | Monitor in `Command ID: 0` | ⏳ |
+| T2.1 | Build thành công (với ESP-SR) | Click **🔧 Build** | Không có lỗi `Failed to allocate tensors` | ✅ |
+| T2.2 | Khởi động board | Click **🔥** | Monitor in `AFE OK`, `MultiNet OK`, `detect_task OK — say 'Hi ESP'` | ✅ |
+| T2.2b | **Model đúng version** | Xem log boot | Phải thấy `WakeNet: wn9_hiesp` | ⏳ Cần xác nhận |
+| T2.2c | **Amplitude OK** | Xem log `Max amplitude` khi nói | > 3000 khi nói bình thường | ⏳ Cần thêm log |
+| T2.3 | Wake word | Nói **"Hi ESP"** | Monitor in `WAKE WORD detected!` trong ≤ 1 giây | ⏳ Đang debug |
+| T2.4 | Lệnh đỏ | Sau wake word, nói **"turn on red"** | Monitor in `COMMAND id=0 phrase='turn on red'` | ⏳ |
 | T2.5 | Lệnh xanh | Sau wake word, nói **"turn on blue"** | Monitor in đúng Command ID tương ứng | ⏳ |
 | T2.6 | Không có false positive | Im lặng 30 giây | Không có random wake, không có random command | ⏳ |
 | T2.7 | Kiểm tra heap | Xem Monitor sau 5 phút | `Free heap` không giảm tuyến tính | ⏳ |
 
-**→ Chỉ tiếp tục khi T2.3 và T2.4/T2.5 đều xanh.**
+**→ Chỉ tiếp tục khi T2.3 và T2.4/T2.5 đều xanh.**  
+**→ Debug theo thứ tự: T2.2b → T2.2c → T2.3** (xem mục 2.4b).
 
+> 💡 **Wake word không nhận:** Làm theo checklist mục 2.4b theo thứ tự — bắt đầu bằng xác nhận model wn9, sau đó fix shift `>> 14`, rồi hạ threshold.  
 > 💡 **Debug `LoadProhibited` khi khởi động:** PSRAM chưa được bật đúng trong menuconfig.  
-> 💡 **Wake word không nhận:** Thử nói chậm rõ hơn, kiểm tra VAD threshold trong `afe_config`.  
 > 💡 **Heap giảm liên tục:** Có memory leak — kiểm tra xem `afe_fetch_result_t` có được free sau khi dùng không.  
 > 💡 **Build lỗi thiếu model:** Đảm bảo đã chọn đúng `wn9_hiesp` và `mn6_en` trong menuconfig trước khi build.
 
@@ -738,7 +840,9 @@ Giai đoạn 0 ──► Giai đoạn 1 ──► Giai đoạn 2 ──► Giai 
   Môi trường       I2S RAW          AI/ESP-SR         LED PWM        WiFi + WS       FreeRTOS
   (5 test)         (6 test)         (7 test)           (8 test)       (8 test)        (8 test)
       ↓                ↓                ↓                  ↓               ↓               ↓
-  ✅ DONE          ✅ DONE          🔄 ĐANG LÀM       ⏳ Chờ          ⏳ Chờ           ⏳ Chờ
+  ✅ DONE          ✅ DONE     🔄 AFE/MultiNet ✅      ⏳ Chờ          ⏳ Chờ           ⏳ Chờ
+                              WakeNet ⏳ debug
+                              (xem mục 2.4b)
 ```
 
 Mỗi giai đoạn **kế thừa code** từ giai đoạn trước — không có bước nào viết lại từ đầu.  
@@ -755,7 +859,10 @@ Mỗi bộ test **verify đầu ra** của giai đoạn đó **trước khi** co
 | Số in ra toàn 0 | 1 | Chân L/R không nối GND | Kiểm tra và nối L/R xuống GND |
 | `LoadProhibited` exception | 2 | PSRAM chưa bật | Bật PSRAM Octal trong menuconfig |
 | `Failed to allocate tensors` | 2 | Không đủ RAM cho model | Cần ESP32-S3 N16R8 (8MB PSRAM) |
-| Wake word không nhận | 2 | VAD threshold quá cao | Giảm `vad_init` sensitivity hoặc nói gần mic hơn |
+| Wake word không nhận (wakeup_state=0) | 2 | Shift bit sai (`>> 10` thay vì `>> 14`) | Đổi sang `buf16[i] = (int16_t)(buf32[i] >> 14)` |
+| Wake word không nhận (tiếp) | 2 | Model không phải wn9_hiesp | Kiểm tra log boot: phải thấy `WakeNet: wn9_hiesp` |
+| Wake word không nhận (tiếp) | 2 | Threshold quá cao | Hạ `set_wakenet_threshold` xuống `0.25f` |
+| Wake word không nhận (tiếp) | 2 | AFE_MODE_HIGH_PERF gây bottleneck | Thử đổi sang `AFE_MODE_LOW_COST` |
 | LED nhấp nháy khi mic hoạt động | 3 | I2S interrupt xung đột PWM | Tăng LEDC frequency lên 10kHz |
 | Heap giảm liên tục | 2/4 | Memory leak | Kiểm tra `cJSON_Delete()` và `afe_fetch_result` free |
 | Giọng nói lag sau khi bật WiFi | 4 | Task chạy cùng core | Ghim WiFi task vào Core 0, AI task vào Core 1 |
@@ -766,7 +873,7 @@ Mỗi bộ test **verify đầu ra** của giai đoạn đó **trước khi** co
 ## 📁 Cấu Trúc Thư Mục Đề Xuất
 
 ```
-led_voice_control/
+hello_world/
 ├── CMakeLists.txt
 ├── partitions.csv           ← Phân vùng flash tùy chỉnh cho AI models
 ├── sdkconfig                ← Cấu hình menuconfig (commit file này!)
@@ -791,7 +898,8 @@ led_voice_control/
 
 | Mục | Plan gốc | Thực tế đã làm | Lý do |
 |---|---|---|---|
-| Cài ESP-SR | `set(EXTRA_COMPONENT_DIRS)` + clone thủ công | `idf_component.yml` + Component Manager | Chuẩn hơn cho IDF v5+, không cần clone thủ công |
+| AFE API | `AFE_CONFIG_DEFAULT()` + `&ESP_AFE_SR_HANDLE` | `afe_config_init()` + `esp_afe_handle_from_config()` | API mới của esp-sr >= 2.x, tương thích IDF v6.0 — API cũ không còn hỗ trợ |
+| MultiNet API | `&esp_mn_handle` | `esp_mn_handle_from_name()` + `multinet->detect()` | API mới, kết quả qua `get_results()` thay vì `command_id` trực tiếp |
 | REQUIRES I2S | `REQUIRES driver` | `REQUIRES driver esp_driver_i2s` | Khai báo tường minh, tránh phụ thuộc ngầm |
 | Model WakeNet | Ghi chung "Hi ESP" | `wn9_hiesp` (WakeNet9) | Version cụ thể, xác nhận qua menuconfig |
 | Model MultiNet | Ghi chung "English" | `mn6_en` (MultiNet6 English) | Version cụ thể, xác nhận qua menuconfig |
@@ -801,4 +909,4 @@ led_voice_control/
 
 *Build plan cập nhật theo tiến trình thực tế.*  
 *Môi trường: Ubuntu 24.04 | ESP-IDF v6.0 qua EIM | VS Code Build/Flash/Monitor icons | ESP32-S3 N16R8*  
-*Cập nhật lần cuối: Sau khi hoàn thành setup ESP-SR (idf_component.yml + menuconfig wn9_hiesp/mn6_en + build)*
+*Cập nhật lần cuối: 22/04/2026 — AFE + MultiNet OK, đang debug wake word wn9_hiesp (xem mục 2.4b)*

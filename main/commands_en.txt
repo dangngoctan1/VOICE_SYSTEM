@@ -1,8 +1,0 @@
-turn on red
-make it red
-turn on green
-make it green
-turn on blue
-make it blue
-turn off
-lights off
