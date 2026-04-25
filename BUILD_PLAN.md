@@ -51,9 +51,9 @@
 | Chân HW-479 | GPIO ESP32-S3 | Ghi chú |
 |---|---|---|
 | GND (-) | GND | Cực âm chung |
-| R (Red) | GPIO 7 | PWM kênh đỏ |
-| G (Green) | GPIO 8 | PWM kênh xanh lá |
-| B (Blue) | GPIO 9 | PWM kênh xanh dương |
+| R (Red) | GPIO 15 | PWM kênh đỏ |
+| G (Green) | GPIO 16 | PWM kênh xanh lá |
+| B (Blue) | GPIO 17 | PWM kênh xanh dương |
 
 > **Lý do chọn GPIO 7/8/9 cho LED:** Tránh xung đột với I2S đang dùng GPIO 4/5/6.
 

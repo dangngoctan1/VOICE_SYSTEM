@@ -1,3 +1,5 @@
+#include "led_control.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +22,16 @@ static esp_afe_sr_data_t        *afe_data   = NULL;
 static const esp_mn_iface_t     *multinet   = NULL;
 static model_iface_data_t       *model_data = NULL;
 
+static const led_event_t CMD_COLORS[] = {
+    {255, 0,   0  },  // 0: turn on red
+    {255, 0,   0  },  // 1: make it red
+    {0,   255, 0  },  // 2: turn on green
+    {0,   255, 0  },  // 3: make it green
+    {0,   0,   255},  // 4: turn on blue
+    {0,   0,   255},  // 5: make it blue
+    {0,   0,   0  },  // 6: turn off
+    {0,   0,   0  },  // 7: lights off
+};
 
 static void init_i2s(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -211,13 +223,19 @@ static void audio_detect_task(void *arg) {
 
             if (state == ESP_MN_STATE_DETECTED) {
                 esp_mn_results_t *r = multinet->get_results(model_data);
+                int cmd = r->command_id[0];
 
                 ESP_LOGI(TAG, ">>> COMMAND id=%d phrase='%s' prob=%.2f",
-                         r->command_id[0], r->string, r->prob[0]);
+                        cmd, r->string, r->prob[0]);
+
+                if (cmd >= 0 && cmd < 8) {
+                    xQueueSend(led_queue, &CMD_COLORS[cmd], 0);
+                }
 
                 listening = false;
                 ESP_LOGI(TAG, "Free heap: %lu", esp_get_free_heap_size());
             }
+
             else if (state == ESP_MN_STATE_TIMEOUT) {
                 ESP_LOGW(TAG, ">>> TIMEOUT");
                 listening = false;
@@ -231,24 +249,12 @@ static void audio_detect_task(void *arg) {
 void app_main(void)
 {
     ESP_LOGI(TAG, "System start");
-
+    led_init();
     init_i2s();
     init_afe();
     init_multinet();
 
-    xTaskCreatePinnedToCore(audio_feed_task,
-                            "feed_task",
-                            8192,       
-                            NULL,
-                            8,
-                            NULL,
-                            1);
-
-    xTaskCreatePinnedToCore(audio_detect_task,
-                            "detect_task",
-                            8192,
-                            NULL,
-                            7,
-                            NULL,
-                            1);
+    xTaskCreatePinnedToCore(audio_feed_task,   "feed_task",   8192, NULL, 8, NULL, 1);
+    xTaskCreatePinnedToCore(audio_detect_task, "detect_task", 8192, NULL, 7, NULL, 1);
+    xTaskCreatePinnedToCore(led_control_task,  "led_task",    4096, NULL, 5, NULL, 0);
 }

@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "hello_world.c"
+    SRCS "led_control.c" "hello_world.c" 
     INCLUDE_DIRS "."
-    REQUIRES driver esp_driver_i2s esp-sr
+    REQUIRES driver esp_driver_i2s esp-sr esp_driver_ledc
 )
